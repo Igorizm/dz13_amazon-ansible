@@ -1,0 +1,131 @@
+---
+# 1. Развертывание 2 нод в AWS EC2
+- name: Provision AWS EC2 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    aws_region: "us-east-1"
+    key_name: "my-aws-key"
+    ami_id: "ami-0c7217cdde317cfec" # Ubuntu 22.04 LTS
+    security_group: "default"
+
+  tasks:
+    - name: Launch Build EC2 Instance
+      amazon.aws.ec2_instance:
+        name: "java-build-node"
+        region: "{{ aws_region }}"
+        key_name: "{{ key_name }}"
+        instance_type: "t3.small"
+        image_id: "{{ ami_id }}"
+        security_group: "{{ security_group }}"
+        network:
+          assign_public_ip: true
+        wait: true
+        count: 1
+      register: build_ec2
+
+    - name: Launch Prod EC2 Instance
+      amazon.aws.ec2_instance:
+        name: "java-prod-node"
+        region: "{{ aws_region }}"
+        key_name: "{{ key_name }}"
+        instance_type: "t3.micro"
+        image_id: "{{ ami_id }}"
+        security_group: "{{ security_group }}"
+        network:
+          assign_public_ip: true
+        wait: true
+        count: 1
+      register: prod_ec2
+
+    - name: Add Build node to dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ build_ec2.instances[0].public_ip_address }}"
+        groups: build_servers
+        ansible_user: ubuntu
+
+    - name: Add Prod node to dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ prod_ec2.instances[0].public_ip_address }}"
+        groups: prod_servers
+        ansible_user: ubuntu
+
+    - name: Wait for SSH on both EC2 instances
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 22
+        delay: 10
+        timeout: 300
+      loop:
+        - "{{ build_ec2.instances[0].public_ip_address }}"
+        - "{{ prod_ec2.instances[0].public_ip_address }}"
+
+# 2. Сборка Java проекта на сборочной ноде
+- name: Build Java Project
+  hosts: build_servers
+  become: true
+  vars:
+    repo_url: "https://github.com/spring-projects/spring-petclinic.git"
+    project_dir: "/opt/java-app"
+
+  tasks:
+    - name: Install Git, OpenJDK 17 and Maven
+      ansible.builtin.apt:
+        name:
+          - git
+          - openjdk-17-jdk
+          - maven
+        state: present
+        update_cache: true
+
+    - name: Clone Java repository
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ project_dir }}"
+        version: main
+
+    - name: Build JAR artifact with Maven
+      ansible.builtin.command:
+        cmd: mvn clean package -DskipTests
+        chdir: "{{ project_dir }}"
+
+    - name: Find built JAR file
+      ansible.builtin.find:
+        paths: "{{ project_dir }}/target"
+        patterns: "*.jar"
+      register: jar_files
+
+    - name: Fetch JAR artifact to Ansible controller
+      ansible.builtin.fetch:
+        src: "{{ jar_files.files[0].path }}"
+        dest: "/tmp/app.jar"
+        flat: true
+
+# 3. Передача артефакта и запуск на продовой ноде
+- name: Deploy and Run Java App on Prod
+  hosts: prod_servers
+  become: true
+
+  tasks:
+    - name: Install OpenJDK 17 JRE
+      ansible.builtin.apt:
+        name: openjdk-17-jre
+        state: present
+        update_cache: true
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: /opt/prod-app
+        state: directory
+        mode: '0755'
+
+    - name: Copy JAR artifact to Prod node
+      ansible.builtin.copy:
+        src: "/tmp/app.jar"
+        dest: "/opt/prod-app/app.jar"
+        mode: '0755'
+
+    - name: Start Java application in background
+      ansible.builtin.shell:
+        cmd: "nohup java -jar /opt/prod-app/app.jar > /opt/prod-app/app.log 2>&1 &"
